@@ -1,0 +1,33 @@
+server:
+  port: 8080
+  host: "0.0.0.0"
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "terraform_indexer"
+  password: "password"
+  database: "terraform_dashboard"
+  ssl_mode: "disable"
+
+collectors:
+  - name: "mock-s3"
+    type: "mock"
+    enabled: true
+    settings:
+      source: "s3"
+  - name: "mock-k8s"
+    type: "mock"
+    enabled: true
+    settings:
+      source: "kubernetes"
+
+polling:
+  interval: "30s"
+
+logging:
+  level: "info"
+
+metrics:
+  enabled: true
+  path: "/metrics"
