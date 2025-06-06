@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -72,6 +73,9 @@ func runIndexer(cmd *cobra.Command, args []string) {
 	
 	logger.Info("Starting terraform-indexer")
 	
+	// Initialize metrics
+	metrics := utils.NewMetrics()
+	
 	// Initialize database
 	dbConfig := db.Config{
 		Host:     viper.GetString("database.host"),
@@ -124,7 +128,9 @@ func runIndexer(cmd *cobra.Command, args []string) {
 	}
 	
 	// Start HTTP server for metrics and health checks
-	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		healthHandler(w, r, database)
+	})
 	if viper.GetBool("metrics.enabled") {
 		http.Handle(viper.GetString("metrics.path"), promhttp.Handler())
 	}
@@ -147,22 +153,26 @@ func runIndexer(cmd *cobra.Command, args []string) {
 	var wg sync.WaitGroup
 	
 	// Collector workers
-	for _, coll := range collectors {
+	for i, coll := range collectors {
 		wg.Add(1)
-		go collectorWorker(ctx, &wg, coll, fileQueue)
+		go collectorWorker(ctx, &wg, coll, fileQueue, metrics, fmt.Sprintf("collector-%d", i))
 	}
 	
 	// Parser workers
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
-		go parserWorker(ctx, &wg, parserRegistry, fileQueue, objectQueue)
+		go parserWorker(ctx, &wg, parserRegistry, fileQueue, objectQueue, metrics, fmt.Sprintf("parser-%d", i))
 	}
 	
 	// Writer workers
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
-		go writerWorker(ctx, &wg, dbWriter, objectQueue)
+		go writerWorker(ctx, &wg, dbWriter, objectQueue, metrics, fmt.Sprintf("writer-%d", i))
 	}
+	
+	// Queue metrics updater
+	wg.Add(1)
+	go queueMetricsWorker(ctx, &wg, fileQueue, objectQueue, metrics)
 	
 	logger.Info("All workers started")
 	
@@ -185,7 +195,7 @@ func runIndexer(cmd *cobra.Command, args []string) {
 	logger.Info("Shutdown complete")
 }
 
-func collectorWorker(ctx context.Context, wg *sync.WaitGroup, coll collector.Collector, fileQueue queue.FileQueue) {
+func collectorWorker(ctx context.Context, wg *sync.WaitGroup, coll collector.Collector, fileQueue queue.FileQueue, metrics *utils.Metrics, workerID string) {
 	defer wg.Done()
 	
 	interval := viper.GetDuration("polling.interval")
@@ -193,21 +203,30 @@ func collectorWorker(ctx context.Context, wg *sync.WaitGroup, coll collector.Col
 	defer ticker.Stop()
 	
 	logger.Infof("Starting collector worker: %s", coll.Name())
+	metrics.WorkerStatus.WithLabelValues("collector", workerID).Set(1)
+	defer metrics.WorkerStatus.WithLabelValues("collector", workerID).Set(0)
 	
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			timer := prometheus.NewTimer(metrics.ProcessingTime.WithLabelValues("collector", "collect"))
 			files, err := coll.Collect(ctx)
+			timer.ObserveDuration()
+			
 			if err != nil {
 				logger.Errorf("Collector %s failed: %v", coll.Name(), err)
+				metrics.ProcessingErrors.WithLabelValues("collector", "collect_failed").Inc()
 				continue
 			}
 			
 			for _, file := range files {
 				if err := fileQueue.Enqueue(ctx, file); err != nil {
 					logger.Errorf("Failed to enqueue file: %v", err)
+					metrics.ProcessingErrors.WithLabelValues("collector", "enqueue_failed").Inc()
+				} else {
+					metrics.FilesCollected.WithLabelValues(string(file.Source), string(file.FileType)).Inc()
 				}
 			}
 			
@@ -216,10 +235,12 @@ func collectorWorker(ctx context.Context, wg *sync.WaitGroup, coll collector.Col
 	}
 }
 
-func parserWorker(ctx context.Context, wg *sync.WaitGroup, parserRegistry *parser.ParserRegistry, fileQueue queue.FileQueue, objectQueue queue.ObjectQueue) {
+func parserWorker(ctx context.Context, wg *sync.WaitGroup, parserRegistry *parser.ParserRegistry, fileQueue queue.FileQueue, objectQueue queue.ObjectQueue, metrics *utils.Metrics, workerID string) {
 	defer wg.Done()
 	
 	logger.Info("Starting parser worker")
+	metrics.WorkerStatus.WithLabelValues("parser", workerID).Set(1)
+	defer metrics.WorkerStatus.WithLabelValues("parser", workerID).Set(0)
 	
 	for {
 		select {
@@ -232,18 +253,26 @@ func parserWorker(ctx context.Context, wg *sync.WaitGroup, parserRegistry *parse
 					return
 				}
 				logger.Errorf("Failed to dequeue file: %v", err)
+				metrics.ProcessingErrors.WithLabelValues("parser", "dequeue_failed").Inc()
 				continue
 			}
 			
+			timer := prometheus.NewTimer(metrics.ProcessingTime.WithLabelValues("parser", "parse"))
 			objects, err := parserRegistry.Parse(ctx, file)
+			timer.ObserveDuration()
+			
 			if err != nil {
 				logger.Errorf("Failed to parse file %s: %v", file.ID, err)
+				metrics.ProcessingErrors.WithLabelValues("parser", "parse_failed").Inc()
 				continue
 			}
 			
 			for _, obj := range objects {
 				if err := objectQueue.Enqueue(ctx, obj); err != nil {
 					logger.Errorf("Failed to enqueue object: %v", err)
+					metrics.ProcessingErrors.WithLabelValues("parser", "enqueue_failed").Inc()
+				} else {
+					metrics.ObjectsParsed.WithLabelValues(string(obj.Type), string(file.FileType)).Inc()
 				}
 			}
 			
@@ -252,10 +281,12 @@ func parserWorker(ctx context.Context, wg *sync.WaitGroup, parserRegistry *parse
 	}
 }
 
-func writerWorker(ctx context.Context, wg *sync.WaitGroup, dbWriter writer.Writer, objectQueue queue.ObjectQueue) {
+func writerWorker(ctx context.Context, wg *sync.WaitGroup, dbWriter writer.Writer, objectQueue queue.ObjectQueue, metrics *utils.Metrics, workerID string) {
 	defer wg.Done()
 	
 	logger.Info("Starting writer worker")
+	metrics.WorkerStatus.WithLabelValues("writer", workerID).Set(1)
+	defer metrics.WorkerStatus.WithLabelValues("writer", workerID).Set(0)
 	
 	for {
 		select {
@@ -268,21 +299,52 @@ func writerWorker(ctx context.Context, wg *sync.WaitGroup, dbWriter writer.Write
 					return
 				}
 				logger.Errorf("Failed to dequeue object: %v", err)
+				metrics.ProcessingErrors.WithLabelValues("writer", "dequeue_failed").Inc()
 				continue
 			}
 			
+			timer := prometheus.NewTimer(metrics.ProcessingTime.WithLabelValues("writer", "write"))
 			if err := dbWriter.WriteObject(ctx, obj); err != nil {
 				logger.Errorf("Failed to write object %s: %v", obj.ID, err)
+				metrics.ProcessingErrors.WithLabelValues("writer", "write_failed").Inc()
+				timer.ObserveDuration()
 				continue
 			}
+			timer.ObserveDuration()
 			
+			metrics.ObjectsWritten.WithLabelValues(string(obj.Type)).Inc()
 			logger.Debugf("Wrote object %s to database", obj.ID)
 		}
 	}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+func queueMetricsWorker(ctx context.Context, wg *sync.WaitGroup, fileQueue queue.FileQueue, objectQueue queue.ObjectQueue, metrics *utils.Metrics) {
+	defer wg.Done()
+	
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			metrics.QueueSize.WithLabelValues("files").Set(float64(fileQueue.Size()))
+			metrics.QueueSize.WithLabelValues("objects").Set(float64(objectQueue.Size()))
+		}
+	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request, database *db.DB) {
 	w.Header().Set("Content-Type", "application/json")
+	
+	// Check database connectivity
+	if err := database.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"status":"unhealthy","error":"database_connection_failed"}`))
+		return
+	}
+	
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"healthy"}`))
 }

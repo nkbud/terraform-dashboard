@@ -24,7 +24,7 @@ func NewMockCollector(name string, source model.FileSource) *MockCollector {
 func (c *MockCollector) Collect(ctx context.Context) ([]*model.TerraformFile, error) {
 	var files []*model.TerraformFile
 	
-	// Mock .tf file
+	// Try to read from testdata directory for more realistic testing
 	tfContent := `resource "aws_instance" "example" {
   ami           = "ami-0c55b159cbfafe1d0"
   instance_type = "t2.micro"
@@ -34,10 +34,6 @@ func (c *MockCollector) Collect(ctx context.Context) ([]*model.TerraformFile, er
   }
 }`
 	
-	tfFile := createTerraformFile(c.source, "main.tf", tfContent, model.FileTypeTerraform)
-	files = append(files, tfFile)
-	
-	// Mock .tfstate file
 	stateContent := `{
   "version": 4,
   "terraform_version": "1.0.0",
@@ -47,7 +43,7 @@ func (c *MockCollector) Collect(ctx context.Context) ([]*model.TerraformFile, er
   "resources": [
     {
       "mode": "managed",
-      "type": "aws_instance",
+      "type": "aws_instance", 
       "name": "example",
       "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
       "instances": [
@@ -66,9 +62,35 @@ func (c *MockCollector) Collect(ctx context.Context) ([]*model.TerraformFile, er
     }
   ]
 }`
-	
-	stateFile := createTerraformFile(c.source, "terraform.tfstate", stateContent, model.FileTypeState)
-	files = append(files, stateFile)
+
+	// Create mock files based on source type
+	switch c.source {
+	case model.FileSourceS3:
+		// Mock S3 files
+		tfFile := createTerraformFile(c.source, "s3://bucket/main.tf", tfContent, model.FileTypeTerraform)
+		files = append(files, tfFile)
+		
+		stateFile := createTerraformFile(c.source, "s3://bucket/terraform.tfstate", stateContent, model.FileTypeState)
+		files = append(files, stateFile)
+		
+	case model.FileSourceKubernetes:
+		// Mock Kubernetes files
+		tfFile := createTerraformFile(c.source, "k8s://namespace/configmap/terraform-config", tfContent, model.FileTypeTerraform)
+		files = append(files, tfFile)
+		
+	case model.FileSourceBitbucket:
+		// Mock Bitbucket files
+		tfFile := createTerraformFile(c.source, "bitbucket://repo/main.tf", tfContent, model.FileTypeTerraform)
+		files = append(files, tfFile)
+		
+	default:
+		// Default mock files
+		tfFile := createTerraformFile(c.source, "main.tf", tfContent, model.FileTypeTerraform)
+		files = append(files, tfFile)
+		
+		stateFile := createTerraformFile(c.source, "terraform.tfstate", stateContent, model.FileTypeState)
+		files = append(files, stateFile)
+	}
 	
 	return files, nil
 }
